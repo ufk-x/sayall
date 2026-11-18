@@ -1,0 +1,342 @@
+import Foundation
+import Testing
+@testable import RemoteMic
+
+@Suite("Chromecast integration")
+struct ChromecastIntegrationTests {
+    // MARK: - 语音键隔离
+
+    @Test func voiceKeyLatchKeepsHardwareOwnersIndependent() {
+        var latch = VoiceFunctionKeyLatch()
+
+        // Siri Remote 先按住。
+        #expect(latch.transition(streaming: true, owner: .appleRemote) == .press)
+        // Chromecast 同时按住：不得产生第二次按下，也不得取消 Siri。
+        #expect(latch.transition(streaming: true, owner: .chromecast) == nil)
+        #expect(latch.isHeld)
+        // Siri 松手：Chromecast 仍按住，语音键不得抬起。
+        #expect(latch.transition(streaming: false, owner: .appleRemote) == nil)
+        #expect(latch.isHeld)
+        // Chromecast 松手：此时才真正抬起。
+        #expect(latch.transition(streaming: false, owner: .chromecast) == .release)
+        #expect(!latch.isHeld)
+    }
+
+    @Test func chromecastPressesAndReleasesVoiceKeyOnItsOwn() {
+        var latch = VoiceFunctionKeyLatch()
+
+        #expect(latch.transition(streaming: true, owner: .chromecast) == .press)
+        #expect(latch.isHeld)
+        #expect(latch.transition(streaming: false, owner: .chromecast) == .release)
+        #expect(!latch.isHeld)
+    }
+
+    @Test func chromecastOwnerIsDistinctFromEveryOtherHardware() {
+        let owners: Set<VoiceFunctionKeyLatch.Owner> = [
+            .bluetooth,
+            .appleRemote,
+            .chromecast,
+            .mobile,
+        ]
+        #expect(owners.count == 4)
+    }
+
+    // MARK: - 产品默认值
+
+    @Test func productDefaultVoiceModeIsToggle() {
+        // 需求：toggle 为默认语音模式，hold 保留给用户可选切换。
+        #expect(ChromecastVoiceMode.productDefault == .toggle)
+        #expect(ChromecastVoiceMode.allCases == [.toggle, .hold])
+    }
+
+    @Test func everyLinkStatusHasALocalizationKey() {
+        let statuses: [ChromecastLinkStatus] = [
+            .unavailable,
+            .disabled,
+            .searching,
+            .connecting,
+            .unauthorized,
+            .unsupported(reason: "8 kHz"),
+            .connected(displayName: "remote"),
+            .disconnected,
+        ]
+        for status in statuses {
+            #expect(status.localizationKey.hasPrefix("chromecast."))
+        }
+        #expect(ChromecastLinkStatus.connected(displayName: "x").isConnected)
+        #expect(ChromecastLinkStatus.connected(displayName: "x").isActive)
+        #expect(!ChromecastLinkStatus.disabled.isActive)
+    }
+
+    @Test func voiceEndReasonsDistinguishNormalFromForced() {
+        #expect(ChromecastVoiceEndReason.holdRelease.isNormal)
+        #expect(ChromecastVoiceEndReason.toggleSecondTap.isNormal)
+        #expect(!ChromecastVoiceEndReason.hostStop.isNormal)
+        #expect(!ChromecastVoiceEndReason.cancelled("link_unavailable").isNormal)
+    }
+
+    @Test @MainActor func forcedVoiceEndIsFailureEvenWhenAllReceivedAudioPlayed() {
+        #expect(BridgeAppModel.voiceSessionCompletionFailureReason(
+            received: 48000, scheduled: 48000, played: 48000,
+            interrupted: 0, pending: 0, failureCount: 0
+        ) == nil)
+        #expect(BridgeAppModel.voiceSessionCompletionFailureReason(
+            received: 48000, scheduled: 48000, played: 48000,
+            interrupted: 0, pending: 0, failureCount: 0,
+            forcedStopReason: "cancelled.audio_timeout"
+        ) == "cancelled.audio_timeout")
+        #expect(BridgeAppModel.voiceSessionCompletionFailureReason(
+            received: 48000, scheduled: 48000, played: 48000,
+            interrupted: 0, pending: 0, failureCount: 0,
+            forcedStopReason: "untrusted_diagnostic_detail"
+        ) == "session_stopped")
+    }
+
+    // MARK: - 缺包时的退化行为
+
+    @Test func integrationCanDisableHardwareForOffscreenTests() {
+        // Offscreen tests exercise host routing without opening real BLE/HID devices.
+        let integration = ChromecastFeatureIntegration(hardwareEnabled: false)
+        var eventCount = 0
+        integration.onVoiceStart = { eventCount += 1 }
+        integration.onVoiceSustain = { eventCount += 1 }
+        integration.onVoiceStop = { _ in eventCount += 1 }
+        integration.onSamples = { _, _ in eventCount += 1 }
+        integration.onStatusChange = { _ in eventCount += 1 }
+        integration.onControlEvent = { _ in eventCount += 1 }
+        integration.onHIDPresenceChange = { _ in eventCount += 1 }
+
+        integration.start()
+        integration.setVoiceMode(.hold)
+        integration.setControlMappingEnabled(true)
+        integration.setControlMappingEnabled(false)
+        integration.reconnect()
+        integration.notifyHostVoiceSessionEnded()
+        integration.stop()
+
+        #expect(eventCount == 0)
+        #expect(!integration.isHIDRemotePresent)
+    }
+
+    // MARK: - 打包与接线契约
+
+    @Test func chromecastPackageStaysOptionalForHostBuilds() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let packageSource = try String(
+            contentsOf: root.appendingPathComponent("Package.swift"),
+            encoding: .utf8
+        )
+        let buildSource = try String(
+            contentsOf: root.appendingPathComponent("scripts/build-app.sh"),
+            encoding: .utf8
+        )
+        let modelSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/BridgeAppModel.swift"),
+            encoding: .utf8
+        )
+
+        #expect(packageSource.contains("SAYALL_CHROMECAST_PACKAGE_PATH"))
+        #expect(packageSource.contains("SAYALL_CHROMECAST_ENABLED"))
+        #expect(packageSource.contains("SayAllChromecast"))
+        #expect(buildSource.contains("SAYALL_CHROMECAST_INCLUDED=false"))
+        #expect(buildSource.contains("SayAllChromecastIncluded"))
+        #expect(modelSource.contains("#if SAYALL_CHROMECAST_ENABLED"))
+        #expect(modelSource.contains("owner: .chromecast"))
+        #expect(modelSource.contains("receiveChromecastAudio"))
+        // 缺失私有包必须是普通的代码路径，不能是构建期 fatalError。
+        #expect(!packageSource.contains("fatalError(\"SAYALL_CHROMECAST"))
+    }
+
+    @Test func chromecastPanelChangesReachTheRuntimeWithoutRestart() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let settingsView = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+        let modelSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/BridgeAppModel.swift"),
+            encoding: .utf8
+        )
+
+        // 面板里开关与模式选择必须走同一条「立即作用于运行时」的入口。
+        #expect(settingsView.contains("model.applyChromecastSettings()"))
+        // 模式推送必须真的发生在运行入口里，而不是只写偏好；
+        // 且推的是「生效模式」——设备自报不支持「按一次」时必须按「按住说话」执行。
+        #expect(modelSource.contains("chromecastFeature.setVoiceMode(effectiveChromecastVoiceMode)"))
+        #expect(modelSource.contains("var effectiveChromecastVoiceMode"))
+        #expect(modelSource.contains("func applyChromecastSettings()"))
+    }
+
+    // MARK: - 按键页契约
+
+    @Test func everyChromecastControlMapsToItsOwnRemoteButton() {
+        let expected: [ChromecastRemoteControl: RemoteButton] = [
+            .power: .power,
+            .up: .up,
+            .down: .down,
+            .left: .left,
+            .right: .right,
+            .select: .ok,
+            .back: .back,
+            .home: .home,
+            .mute: .mute,
+            .youtube: .youtube,
+            .netflix: .netflix,
+            .input: .input,
+            .volumeUp: .volumeUp,
+            .volumeDown: .volumeDown,
+        ]
+        #expect(ChromecastRemoteControl.allCases.count == expected.count)
+        for control in ChromecastRemoteControl.allCases {
+            #expect(control.remoteButton == expected[control])
+        }
+        // 一控一键：两个控件映射到同一个键位会让其中一个的配置永远读不到。
+        #expect(Set(ChromecastRemoteControl.allCases.map(\.remoteButton)).count == expected.count)
+    }
+
+    // MARK: - 左、确定、右默认可用
+
+    @Test func navigationKeysRemainAvailableWithEveryLegacyPreference() {
+        for allow in [false, true] {
+            for exceptions: Set<String> in [[], ["left"], ["left", "right", "select"]] {
+                for control: ChromecastRemoteControl in [.left, .select, .right] {
+                    #expect(!ChromecastRemoteControl.isSystemManaged(
+                        control, allowSystemReservedKeys: allow, exceptions: exceptions
+                    ))
+                }
+                #expect(ChromecastRemoteControl.canvasReservedControlIDs(
+                    allowSystemReservedKeys: allow, exceptions: exceptions
+                ).isEmpty)
+            }
+        }
+        #expect(!ChromecastRemoteControl.isSystemManaged(.volumeUp, allowSystemReservedKeys: false))
+    }
+
+    @Test func chromecastOnlyButtonsStayOutOfTheXiaomiLayout() {
+        for button in [RemoteButton.youtube, .netflix, .input] {
+            #expect(!RemoteButton.xiaomiCases.contains(button))
+        }
+        // 小米画布的锚点表按 xiaomiCases 生成，新增的键位不得改变它的规模。
+        #expect(RemoteButton.xiaomiCases.count == 12)
+    }
+
+    @Test func chromecastModelIsRoutedToItsOwnAdapter() {
+        #expect(XiaomiRemoteModel.chromecastVoiceRemote.isChromecastRemote)
+        #expect(!XiaomiRemoteModel.chromecastVoiceRemote.isAppleSiriRemote)
+        #expect(XiaomiRemoteModel.chromecastVoiceRemote.usesPrivateAdapter)
+        #expect(XiaomiRemoteModel.appleSiriRemoteA2854.usesPrivateAdapter)
+        #expect(!XiaomiRemoteModel.rc003.usesPrivateAdapter)
+        #expect(XiaomiRemoteModel.chromecastVoiceRemote.stableHardwareModelID == "chromecast-voice-remote")
+        #expect(XiaomiRemoteModel.chromecastVoiceRemote.localizationKey.hasPrefix("remote.device.model."))
+    }
+
+    /// G9N9N 是第三方谷歌电视遥控器，与原装 Chromecast 同链路（BLE HID + ATVV），
+    /// 必须路由到 Chromecast 私有适配器，绝不能落进小米 HID 发现链路。
+    @Test func googleTVRemoteG9N9NIsRoutedToTheChromecastAdapter() {
+        #expect(XiaomiRemoteModel.googleTVRemoteG9N9N.isChromecastRemote)
+        #expect(!XiaomiRemoteModel.googleTVRemoteG9N9N.isAppleSiriRemote)
+        #expect(XiaomiRemoteModel.googleTVRemoteG9N9N.usesPrivateAdapter)
+        #expect(XiaomiRemoteModel.googleTVRemoteG9N9N.stableHardwareModelID == "google-tv-remote-g9n9n")
+        #expect(XiaomiRemoteModel.googleTVRemoteG9N9N.localizationKey.hasPrefix("remote.device.model."))
+        // 电量策略跟随 Chromecast 链路：能力未经真机验证前不得显示电量位。
+        #expect(!RemoteBatteryPresentationPolicy.shouldShowBattery(
+            model: .googleTVRemoteG9N9N,
+            level: 80,
+            powerState: .onBattery
+        ))
+    }
+
+    /// 型号的持久化 rawValue 必须稳定：历史档案解码不得因拼写变化而失败。
+    @Test func googleTVRemoteG9N9NRawValueRoundTrips() throws {
+        let encoded = try JSONEncoder().encode(XiaomiRemoteModel.googleTVRemoteG9N9N)
+        let decoded = try JSONDecoder().decode(XiaomiRemoteModel.self, from: encoded)
+        #expect(decoded == .googleTVRemoteG9N9N)
+        #expect(XiaomiRemoteModel.googleTVRemoteG9N9N.rawValue == "google_tv_remote_g9n9n")
+    }
+
+    /// 该型号不宣告电池能力，界面不得显示一个永远是「未知」的电量位。
+    @Test func chromecastProfileNeverShowsBattery() {
+        #expect(!RemoteBatteryPresentationPolicy.shouldShowBattery(
+            model: .chromecastVoiceRemote,
+            level: 42,
+            powerState: .onBattery
+        ))
+        #expect(!RemoteBatteryPresentationPolicy.shouldShowBattery(
+            model: .chromecastVoiceRemote,
+            level: nil,
+            powerState: .charging
+        ))
+        #expect(RemoteBatteryPresentationPolicy.shouldShowBattery(
+            model: .rc003,
+            level: 42,
+            powerState: .onBattery
+        ))
+    }
+
+    /// Chromecast 设备档案按型号识别并且可重复注册，否则每次连接都会新建一个档案、丢掉映射。
+    @Test func chromecastProfileRegistrationIsIdempotent() throws {
+        let suiteName = "RemoteMicTests.ChromecastProfile.(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+
+        let first = settings.registerChromecastRemote()
+        let second = settings.registerChromecastRemote()
+
+        #expect(first == second)
+        #expect(settings.selectedRemoteProfile?.model == .chromecastVoiceRemote)
+        let profile = try #require(settings.remoteDeviceProfiles.first(where: { $0.id == first }))
+        #expect(profile.model == .chromecastVoiceRemote)
+        #expect(settings.remoteDeviceProfiles.filter { $0.model == .chromecastVoiceRemote }.count == 1)
+    }
+
+    // MARK: - 按键页接线契约
+
+    @Test func mappingPageRoutesChromecastToItsOwnCanvas() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let settingsView = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/SettingsView.swift"),
+            encoding: .utf8
+        )
+        let modelSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/BridgeAppModel.swift"),
+            encoding: .utf8
+        )
+
+        // 按键页必须按型号分派到 Chromecast 画布，且整块受私有包门禁保护。
+        #expect(settingsView.contains("chromecastMappingPage"))
+        #expect(settingsView.contains("canImport(SayAllChromecast)"))
+        // 映射总开关必须真的推给 HID 通道：独占与否决定了按键是被宿主还是被系统消费。
+        #expect(modelSource.contains(
+            "chromecastFeature.setControlMappingEnabled(settings.customMappingEnabled)"
+        ))
+        // 私有包档案不得被小米 HID 发现链路当成候选。
+        #expect(modelSource.contains("!profile.model.usesPrivateAdapter"))
+        // 按键事件必须接到执行链路上，而不是只更新界面状态。
+        #expect(modelSource.contains("handleChromecastControlEvent"))
+        #expect(modelSource.contains("performChromecastConfiguredAction"))
+    }
+
+    @Test func chromecastNeverCapturesFromTheComputerMicrophone() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let modelSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RemoteMic/BridgeAppModel.swift"),
+            encoding: .utf8
+        )
+        // 第一版只走遥控器麦克风到 MiRemoteV 2ch，不做混音、不回退电脑麦克风。
+        #expect(modelSource.contains("route=MiRemoteV_2ch"))
+        #expect(!modelSource.contains("chromecastAudioMixer"))
+    }
+}

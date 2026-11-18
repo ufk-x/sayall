@@ -1,0 +1,700 @@
+import AppleRemoteAudioCore
+import Foundation
+import Security
+import XPC
+
+/// Tracks a native authorization reply; this never grants or relaxes any right.
+struct PacketLoggerAuthorizationWait {
+    static let serverAcceptanceDeadline: TimeInterval = 30
+    let applicationDeadline: TimeInterval?
+    private var awaitingReply = false
+    private var awaitingAcceptance = false
+
+    init(requiresPreparedRule: Bool) {
+        // The prepared flow uses native interactive administrator approval.
+        // Keep its context until the OS replies or this client stops; a timer
+        // cannot cancel AuthorizationCopyRights and would orphan its prompt.
+        applicationDeadline = requiresPreparedRule ? nil : 30
+    }
+
+    mutating func begin() { awaitingReply = true; awaitingAcceptance = false }
+    mutating func cancel() { awaitingReply = false; awaitingAcceptance = false }
+    mutating func complete() -> Bool {
+        guard awaitingReply else { return false }
+        awaitingReply = false
+        awaitingAcceptance = true
+        return true
+    }
+    mutating func serverAccepted() { cancel() }
+    mutating func expire(after elapsed: TimeInterval) -> Bool {
+        guard awaitingReply || awaitingAcceptance, let applicationDeadline,
+              elapsed >= applicationDeadline else { return false }
+        cancel()
+        return true
+    }
+    mutating func expireServerAcceptance(after elapsed: TimeInterval) -> Bool {
+        guard awaitingAcceptance, elapsed >= Self.serverAcceptanceDeadline else { return false }
+        cancel()
+        return true
+    }
+}
+
+public enum PacketLoggerAuthorizationRulePolicy {
+    public static func isStrongEnough(_ values: [String: Any]) -> Bool {
+        guard values["class"] as? String == "user",
+              values["group"] as? String == "admin",
+              values["authenticate-user"] as? Bool == true,
+              values["shared"] as? Bool == false,
+              let timeout = values["timeout"] as? NSNumber,
+              timeout.int64Value == 0, values["rule"] == nil else { return false }
+        // Authorization Services normalizes an omitted session-owner into false.
+        // Both mean no session-owner shortcut; true and non-boolean values fail.
+        return values["session-owner"] == nil || values["session-owner"] as? Bool == false
+    }
+}
+
+/// Narrow in-memory client for macOS's private Bluetooth packet diagnostic service.
+/// Raw packet bytes stay on `stateQueue` and are never logged or written to disk.
+public final class AppleRemotePacketLoggerClient: @unchecked Sendable {
+    public enum AuthorizationProgress: String {
+        case requesting, granted, sealed, submitted
+    }
+    public enum Event: Equatable {
+        case connecting
+        case requiresAuthorization
+        case authorizing
+        case authorized
+        case profileRequired
+        case stopped
+        case failed(Failure)
+    }
+
+    public enum Failure: Equatable {
+        case authorizationCreate(OSStatus)
+        case authorizationRuleLookup(OSStatus)
+        case authorizationRuleTooWeak
+        case authorizationRuleShape(String)
+        case authorizationRuleOwnedByAnotherClient
+        case authorizationRuleRegistration(OSStatus)
+        case authorizationRuleSealFailed
+        case authorizationDenied(OSStatus)
+        case authorizationExternalForm(OSStatus)
+        case authorizationAlreadyAttempted
+        case authorizationRightNotGranted
+        case connectionInterrupted
+        case connectionInvalid
+        case connectionTimedOut
+        case authorizationTimedOut
+        case authorizationAcceptanceTimedOut
+        case malformedMessage(count: Int, hasRequiresAuthorization: Bool, hasPacket: Bool)
+        case malformedPacket
+        case trafficLimitExceeded
+
+        public var diagnosticCode: String {
+            switch self {
+            case .authorizationCreate(let status): return "authorization_create_\(status)"
+            case .authorizationRuleLookup(let status): return "authorization_rule_lookup_\(status)"
+            case .authorizationRuleTooWeak: return "authorization_rule_too_weak"
+            case .authorizationRuleShape(let shape): return "authorization_rule_shape_\(shape)"
+            case .authorizationRuleOwnedByAnotherClient: return "authorization_rule_owned_by_another_client"
+            case .authorizationRuleRegistration(let status): return "authorization_rule_registration_\(status)"
+            case .authorizationRuleSealFailed: return "authorization_rule_seal_failed"
+            case .authorizationDenied(let status): return "authorization_denied_\(status)"
+            case .authorizationExternalForm(let status): return "authorization_external_form_\(status)"
+            case .authorizationAlreadyAttempted: return "authorization_already_attempted"
+            case .authorizationRightNotGranted: return "authorization_right_not_granted"
+            case .connectionInterrupted: return "connection_interrupted"
+            case .connectionInvalid: return "connection_invalid"
+            case .connectionTimedOut: return "connection_timed_out"
+            case .authorizationTimedOut: return "authorization_timed_out"
+            case .authorizationAcceptanceTimedOut: return "authorization_acceptance_timed_out"
+            case .malformedMessage(let count, let hasRequiresAuthorization, let hasPacket):
+                return "malformed_message_count_\(count)_requires_\(hasRequiresAuthorization)_packet_\(hasPacket)"
+            case .malformedPacket: return "malformed_packet"
+            case .trafficLimitExceeded: return "traffic_limit_exceeded"
+            }
+        }
+    }
+
+    private enum State {
+        case stopped
+        case connecting
+        case waitingForAuthorization
+        case authorizing
+        case streaming
+    }
+
+    private enum MessageOrigin {
+        case connection
+        case requestReply
+    }
+
+    private struct AuthorizationGrant {
+        let reference: AuthorizationRef
+        let createdRule: Bool
+    }
+
+    private enum AuthorizationResult {
+        case granted(AuthorizationGrant)
+        case failed(Failure)
+    }
+
+    private static let serviceName = "com.apple.bluetooth.BTPacketLogger"
+    private static let authorizationRight = "com.apple.PacketLogger.HCI"
+    private static let trustedTemporaryOwnerIdentifier =
+        "com.hd838a.SayAll.AppleRemoteHCIService"
+    private static let maximumRecordLength = 13 + 4 + Int(UInt16.max)
+    private static let maximumBytesPerSecond = 8 * 1_024 * 1_024
+    private static let maximumPacketsPerSecond = 20_000
+
+    private let stateQueue: DispatchQueue
+    private let stateQueueKey = DispatchSpecificKey<Void>()
+    private let authorizationQueue = DispatchQueue(
+        label: "com.hd838a.RemoteMic.appleRemote.packetLogger.authorization",
+        qos: .userInitiated
+    )
+    private let callbackQueue: DispatchQueue
+    private let requiresPreparedAuthorizationRule: Bool
+    private let sealsAfterServerAcceptance: Bool
+    private let allowsPacketAsAuthorization: Bool
+    private let sealAuthorizationRight: (@escaping (Bool) -> Void) -> Void
+    private let onPacket: (Data) -> Void
+    private let onEvent: (Event) -> Void
+    private let onAuthorizationProgress: (AuthorizationProgress) -> Void
+
+    private var state = State.stopped
+    private var generation: UInt64 = 0
+    private var connection: xpc_connection_t?
+    private var authorization: AuthorizationRef?
+    private var createdAuthorizationRule = false
+    private var authorizationAttempted = false
+    private var authorizationWait: PacketLoggerAuthorizationWait
+    private var didEmitAuthorized = false
+    private var authorizationRuleSealed = false
+    private var authorizationRuleSealing = false
+    private var trafficWindowStartedAt: UInt64 = 0
+    private var trafficBytes = 0
+    private var trafficPackets = 0
+
+    public init(
+        stateQueue: DispatchQueue,
+        callbackQueue: DispatchQueue,
+        allowsPacketAsAuthorization: Bool = false,
+        requiresPreparedAuthorizationRule: Bool = false,
+        sealsAfterServerAcceptance: Bool = false,
+        sealAuthorizationRight: @escaping (@escaping (Bool) -> Void) -> Void = { completion in
+            completion(true)
+        },
+        onPacket: @escaping (Data) -> Void,
+        onAuthorizationProgress: @escaping (AuthorizationProgress) -> Void = { _ in },
+        onEvent: @escaping (Event) -> Void
+    ) {
+        self.stateQueue = stateQueue
+        self.callbackQueue = callbackQueue
+        self.requiresPreparedAuthorizationRule = requiresPreparedAuthorizationRule
+        authorizationWait = PacketLoggerAuthorizationWait(requiresPreparedRule: requiresPreparedAuthorizationRule)
+        self.sealsAfterServerAcceptance = sealsAfterServerAcceptance
+        self.allowsPacketAsAuthorization = allowsPacketAsAuthorization
+        self.sealAuthorizationRight = sealAuthorizationRight
+        self.onPacket = onPacket
+        self.onEvent = onEvent
+        self.onAuthorizationProgress = onAuthorizationProgress
+        stateQueue.setSpecific(key: stateQueueKey, value: ())
+    }
+
+    deinit {
+        stopSynchronously(emitEvent: false)
+        stateQueue.setSpecific(key: stateQueueKey, value: nil)
+    }
+
+    public func start() {
+        stateQueue.async { [weak self] in
+            self?.startOnQueue()
+        }
+    }
+
+    public func requestAuthorization() {
+        stateQueue.async { [weak self] in
+            self?.requestAuthorizationOnQueue()
+        }
+    }
+
+    public func stop() {
+        stateQueue.async { [weak self] in
+            self?.stopOnQueue(emitEvent: true)
+        }
+    }
+
+    private func startOnQueue() {
+        guard state == .stopped else { return }
+        generation &+= 1
+        let activeGeneration = generation
+        authorizationAttempted = false
+        didEmitAuthorized = false
+        authorizationRuleSealed = false
+        authorizationRuleSealing = false
+        resetTrafficBudget()
+        state = .connecting
+
+        let newConnection = Self.serviceName.withCString { serviceName in
+            xpc_connection_create_mach_service(
+                serviceName,
+                stateQueue,
+                UInt64(XPC_CONNECTION_MACH_SERVICE_PRIVILEGED)
+            )
+        }
+        connection = newConnection
+        xpc_connection_set_event_handler(newConnection) { [weak self] object in
+            self?.handle(object, origin: .connection, generation: activeGeneration)
+        }
+        emit(.connecting)
+        xpc_connection_activate(newConnection)
+        send(xpc_dictionary_create_empty(), over: newConnection, generation: activeGeneration)
+
+        stateQueue.asyncAfter(deadline: .now() + (requiresPreparedAuthorizationRule ? 20 : 5)) { [weak self] in
+            guard let self, self.generation == activeGeneration, self.state == .connecting else { return }
+            self.fail(.connectionTimedOut)
+        }
+    }
+
+    private func requestAuthorizationOnQueue() {
+        guard state == .waitingForAuthorization else { return }
+        guard !authorizationAttempted else {
+            fail(.authorizationAlreadyAttempted)
+            return
+        }
+        authorizationAttempted = true
+        state = .authorizing
+        authorizationWait.begin()
+        let requestGeneration = generation
+        emit(.authorizing)
+
+        let requiresPreparedRule = requiresPreparedAuthorizationRule
+        authorizationProgress(.requesting)
+        authorizationQueue.async { [weak self] in
+            guard self != nil else { return }
+            let result = Self.performAuthorizationRequest(requiresPreparedRule: requiresPreparedRule)
+            guard let queue = self?.stateQueue else {
+                Self.discardAuthorizationResult(result)
+                return
+            }
+            queue.async { [weak self] in
+                guard let self else {
+                    Self.discardAuthorizationResult(result)
+                    return
+                }
+                self.handleAuthorizationResult(result, generation: requestGeneration)
+            }
+        }
+
+        if let timeout = authorizationWait.applicationDeadline {
+            stateQueue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                guard let self, self.generation == requestGeneration, self.state == .authorizing,
+                      self.authorizationWait.expire(after: timeout) else { return }
+                self.fail(.authorizationTimedOut)
+            }
+        }
+    }
+
+    private func handleAuthorizationResult(_ result: AuthorizationResult, generation resultGeneration: UInt64) {
+        guard generation == resultGeneration, state == .authorizing, authorizationWait.complete() else {
+            Self.discardAuthorizationResult(result)
+            return
+        }
+        switch result {
+        case .failed(let failure):
+            fail(failure)
+        case .granted(let grant):
+            let acceptanceDeadline = PacketLoggerAuthorizationWait.serverAcceptanceDeadline
+            stateQueue.asyncAfter(deadline: .now() + acceptanceDeadline) { [weak self] in
+                guard let self, self.generation == resultGeneration, self.state == .authorizing,
+                      self.authorizationWait.expireServerAcceptance(after: acceptanceDeadline) else { return }
+                self.fail(.authorizationAcceptanceTimedOut)
+            }
+            authorizationProgress(.granted)
+            authorization = grant.reference
+            createdAuthorizationRule = grant.createdRule
+            if sealsAfterServerAcceptance {
+                // bluetoothd checks the rule definition after importing the
+                // external form. Do not remove it before that check finishes.
+                sendAuthorizationExternalForm(generation: resultGeneration)
+                return
+            }
+            sealAuthorizationRight { [weak self] sealed in
+                self?.stateQueue.async { [weak self] in
+                    guard let self,
+                          self.generation == resultGeneration,
+                          self.state == .authorizing else {
+                        return
+                    }
+                    guard sealed else {
+                        self.fail(.authorizationRuleSealFailed)
+                        return
+                    }
+                    self.authorizationProgress(.sealed)
+                    self.authorizationRuleSealed = true
+                    self.sendAuthorizationExternalForm(generation: resultGeneration)
+                }
+            }
+        }
+    }
+
+    private static func discardAuthorizationResult(_ result: AuthorizationResult) {
+        if case .granted(let grant) = result {
+            AuthorizationFree(grant.reference, [.destroyRights])
+        }
+    }
+
+    private func sendAuthorizationExternalForm(generation resultGeneration: UInt64) {
+        guard let authorization else {
+            fail(.connectionInvalid)
+            return
+        }
+        var externalForm = AuthorizationExternalForm()
+        let status = AuthorizationMakeExternalForm(authorization, &externalForm)
+        guard status == errAuthorizationSuccess else {
+            fail(.authorizationExternalForm(status))
+            return
+        }
+        let message = xpc_dictionary_create_empty()
+        withUnsafePointer(to: &externalForm) { pointer in
+            xpc_dictionary_set_data(
+                message,
+                "Authentication",
+                UnsafeRawPointer(pointer),
+                MemoryLayout<AuthorizationExternalForm>.size
+            )
+        }
+        _ = withUnsafeMutableBytes(of: &externalForm) { bytes in
+            bytes.initializeMemory(as: UInt8.self, repeating: 0)
+        }
+        guard let connection else {
+            fail(.connectionInvalid)
+            return
+        }
+        send(message, over: connection, generation: resultGeneration)
+        authorizationProgress(.submitted)
+    }
+
+    private func send(
+        _ message: xpc_object_t,
+        over connection: xpc_connection_t,
+        generation requestGeneration: UInt64
+    ) {
+        xpc_connection_send_message_with_reply(connection, message, stateQueue) { [weak self] reply in
+            self?.handle(reply, origin: .requestReply, generation: requestGeneration)
+        }
+    }
+
+    private func handle(
+        _ object: xpc_object_t,
+        origin: MessageOrigin,
+        generation eventGeneration: UInt64
+    ) {
+        guard generation == eventGeneration, state != .stopped else { return }
+        let type = xpc_get_type(object)
+        if type == XPC_TYPE_ERROR {
+            guard origin == .connection else { return }
+            if xpc_equal(object, XPC_ERROR_CONNECTION_INTERRUPTED) {
+                fail(.connectionInterrupted)
+            } else {
+                fail(.connectionInvalid)
+            }
+            return
+        }
+        guard type == XPC_TYPE_DICTIONARY else {
+            fail(.malformedMessage(count: -1, hasRequiresAuthorization: false, hasPacket: false))
+            return
+        }
+        let dictionaryCount = xpc_dictionary_get_count(object)
+        let hasRequiresAuthorization = xpc_dictionary_get_value(object, "RequiresAuth") != nil
+        let hasPacket = xpc_dictionary_get_value(object, "packet") != nil
+        if origin == .requestReply, dictionaryCount == 0 {
+            return
+        }
+        guard dictionaryCount == 1 else {
+            fail(.malformedMessage(
+                count: dictionaryCount,
+                hasRequiresAuthorization: hasRequiresAuthorization,
+                hasPacket: hasPacket
+            ))
+            return
+        }
+
+        if let requiresAuthorization = xpc_dictionary_get_value(object, "RequiresAuth") {
+            guard xpc_get_type(requiresAuthorization) == XPC_TYPE_BOOL else {
+                fail(.malformedMessage(
+                    count: dictionaryCount,
+                    hasRequiresAuthorization: true,
+                    hasPacket: false
+                ))
+                return
+            }
+            if xpc_bool_get_value(requiresAuthorization) {
+                if state == .waitingForAuthorization || state == .authorizing || state == .streaming {
+                    return
+                }
+                state = .waitingForAuthorization
+                emit(.requiresAuthorization)
+            } else {
+                _ = markAuthorized()
+            }
+            return
+        }
+
+        var packetLength = 0
+        guard let packetBytes = xpc_dictionary_get_data(object, "packet", &packetLength),
+              packetLength > 0,
+              packetLength <= Self.maximumRecordLength else {
+            fail(.malformedPacket)
+            return
+        }
+        guard consumeTrafficBudget(packetLength) else {
+            fail(.trafficLimitExceeded)
+            return
+        }
+        let packet = Data(bytes: packetBytes, count: packetLength)
+        if AppleRemotePacketLoggerRecord.isProfileRequired(packet) {
+            state = .stopped
+            invalidateConnection()
+            emit(.profileRequired)
+            return
+        }
+        guard state == .authorizing
+                || state == .streaming
+                || (state == .connecting && allowsPacketAsAuthorization) else {
+            if state == .connecting {
+                // Some macOS builds deliver one early controller packet before
+                // the authoritative RequiresAuth response. It is not proof of
+                // authorization; discard it and keep waiting for the daemon's
+                // explicit readiness state instead of tearing down the stream.
+                return
+            }
+            fail(.malformedMessage(
+                count: dictionaryCount,
+                hasRequiresAuthorization: false,
+                hasPacket: true
+            ))
+            return
+        }
+        guard markAuthorized() else { return }
+        onPacket(packet)
+    }
+
+    @discardableResult
+    private func markAuthorized() -> Bool {
+        if sealsAfterServerAcceptance, !authorizationRuleSealed {
+            guard !authorizationRuleSealing else { return false }
+            authorizationRuleSealing = true
+            let acceptedGeneration = generation
+            sealAuthorizationRight { [weak self] sealed in
+                self?.stateQueue.async { [weak self] in
+                    guard let self, self.generation == acceptedGeneration,
+                          self.state == .authorizing || self.state == .connecting else { return }
+                    guard sealed else { self.fail(.authorizationRuleSealFailed); return }
+                    self.authorizationRuleSealed = true
+                    self.authorizationRuleSealing = false
+                    self.authorizationProgress(.sealed)
+                    _ = self.markAuthorized()
+                }
+            }
+            return false
+        }
+        state = .streaming
+        authorizationWait.serverAccepted()
+        guard !didEmitAuthorized else { return true }
+        didEmitAuthorized = true
+        emit(.authorized)
+        return true
+    }
+
+    private func fail(_ failure: Failure) {
+        authorizationWait.cancel()
+        state = .stopped
+        didEmitAuthorized = false
+        invalidateConnection()
+        emit(.failed(failure))
+    }
+
+    private func stopOnQueue(emitEvent: Bool) {
+        authorizationWait.cancel()
+        generation &+= 1
+        state = .stopped
+        invalidateConnection()
+        releaseAuthorization()
+        resetTrafficBudget()
+        if emitEvent { emit(.stopped) }
+    }
+
+    private func stopSynchronously(emitEvent: Bool) {
+        // The last callback reference can be released on stateQueue itself.
+        if DispatchQueue.getSpecific(key: stateQueueKey) != nil {
+            stopOnQueue(emitEvent: emitEvent)
+        } else {
+            stateQueue.sync {
+                stopOnQueue(emitEvent: emitEvent)
+            }
+        }
+    }
+
+    private func invalidateConnection() {
+        if let connection {
+            xpc_connection_cancel(connection)
+            self.connection = nil
+        }
+    }
+
+    private func releaseAuthorization() {
+        guard let authorization else { return }
+        if createdAuthorizationRule {
+            Self.authorizationRight.withCString { rightName in
+                _ = AuthorizationRightRemove(authorization, rightName)
+            }
+        }
+        AuthorizationFree(authorization, [.destroyRights])
+        self.authorization = nil
+        createdAuthorizationRule = false
+    }
+
+    private func emit(_ event: Event) {
+        callbackQueue.async { [onEvent] in onEvent(event) }
+    }
+
+    private func consumeTrafficBudget(_ byteCount: Int) -> Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        if trafficWindowStartedAt == 0 || now &- trafficWindowStartedAt >= 1_000_000_000 {
+            trafficWindowStartedAt = now
+            trafficBytes = 0
+            trafficPackets = 0
+        }
+        guard byteCount <= Self.maximumBytesPerSecond,
+              trafficBytes <= Self.maximumBytesPerSecond - byteCount,
+              trafficPackets < Self.maximumPacketsPerSecond else { return false }
+        trafficBytes += byteCount
+        trafficPackets += 1
+        return true
+    }
+
+    private func resetTrafficBudget() {
+        trafficWindowStartedAt = 0
+        trafficBytes = 0
+        trafficPackets = 0
+    }
+
+    private static func performAuthorizationRequest(requiresPreparedRule: Bool) -> AuthorizationResult {
+        var authorization: AuthorizationRef?
+        let createStatus = AuthorizationCreate(nil, nil, [], &authorization)
+        guard createStatus == errAuthorizationSuccess, let authorization else {
+            return .failed(.authorizationCreate(createStatus))
+        }
+
+        var createdRule = false
+        var definition: CFDictionary?
+        let lookupStatus = authorizationRight.withCString {
+            AuthorizationRightGet($0, &definition)
+        }
+        if lookupStatus == errAuthorizationDenied {
+            guard !requiresPreparedRule else {
+                AuthorizationFree(authorization, [.destroyRights])
+                return .failed(.authorizationRuleLookup(lookupStatus))
+            }
+            let rule: CFDictionary = [
+                "class" as CFString: "allow" as CFString,
+            ] as CFDictionary
+            let description = (Locale.preferredLanguages.first ?? "en").hasPrefix("zh")
+                ? "允许无线麦 SayAll 接收 Apple Remote 蓝牙音频。"
+                : "Allow SayAll to receive Bluetooth audio from your Apple Remote."
+            let registrationStatus = authorizationRight.withCString {
+                AuthorizationRightSet(
+                    authorization,
+                    $0,
+                    rule,
+                    description as CFString,
+                    nil,
+                    nil
+                )
+            }
+            guard registrationStatus == errAuthorizationSuccess else {
+                AuthorizationFree(authorization, [.destroyRights])
+                return .failed(.authorizationRuleRegistration(registrationStatus))
+            }
+            createdRule = true
+        } else if lookupStatus == errAuthorizationSuccess {
+            guard let definition, authorizationRuleIsStrongEnough(definition) else {
+                let values = definition as? [String: Any] ?? [:]
+                let shape = "user\(values["class"] as? String == "user" ? 1 : 0)" +
+                    "_admin\(values["group"] as? String == "admin" ? 1 : 0)" +
+                    "_auth\((values["authenticate-user"] as? Bool).map { $0 ? 1 : 0 } ?? -1)" +
+                    "_shared\((values["shared"] as? Bool).map { $0 ? 1 : 0 } ?? -1)" +
+                    "_timeout\((values["timeout"] as? NSNumber)?.int64Value ?? -1)" +
+                    "_owner\((values["session-owner"] as? Bool).map { $0 ? 1 : 0 } ?? -1)" +
+                    "_rule\(values["rule"] == nil ? 0 : 1)"
+                AuthorizationFree(authorization, [.destroyRights])
+                return .failed(.authorizationRuleShape(shape))
+            }
+            guard authorizationRuleBelongsToCurrentApp(definition) else {
+                AuthorizationFree(authorization, [.destroyRights])
+                return .failed(.authorizationRuleOwnedByAnotherClient)
+            }
+        } else {
+            AuthorizationFree(authorization, [.destroyRights])
+            return .failed(.authorizationRuleLookup(lookupStatus))
+        }
+
+        var grantedRights: UnsafeMutablePointer<AuthorizationRights>?
+        defer { if let grantedRights { AuthorizationFreeItemSet(grantedRights) } }
+        let status = authorizationRight.withCString { rightName in
+            var item = AuthorizationItem(
+                name: rightName,
+                valueLength: 0,
+                value: nil,
+                flags: 0
+            )
+            return withUnsafeMutablePointer(to: &item) { pointer in
+                var rights = AuthorizationRights(count: 1, items: pointer)
+                return AuthorizationCopyRights(
+                    authorization,
+                    &rights,
+                    nil,
+                    requiresPreparedRule ? [.interactionAllowed, .extendRights]
+                        : [.interactionAllowed, .extendRights, .preAuthorize],
+                    &grantedRights
+                )
+            }
+        }
+        guard status == errAuthorizationSuccess else {
+            if createdRule {
+                authorizationRight.withCString { _ = AuthorizationRightRemove(authorization, $0) }
+            }
+            AuthorizationFree(authorization, [.destroyRights])
+            return .failed(.authorizationDenied(status))
+        }
+        if requiresPreparedRule {
+            guard let grantedRights, grantedRights.pointee.count == 1,
+                  let items = grantedRights.pointee.items,
+                  String(cString: items.pointee.name) == authorizationRight,
+                  items.pointee.flags & 1 == 0 else {
+                AuthorizationFree(authorization, [.destroyRights])
+                return .failed(.authorizationRightNotGranted)
+            }
+        }
+        return .granted(.init(reference: authorization, createdRule: createdRule))
+    }
+
+    private func authorizationProgress(_ value: AuthorizationProgress) {
+        callbackQueue.async { [onAuthorizationProgress] in onAuthorizationProgress(value) }
+    }
+
+    private static func authorizationRuleIsStrongEnough(_ definition: CFDictionary) -> Bool {
+        PacketLoggerAuthorizationRulePolicy.isStrongEnough(definition as? [String: Any] ?? [:])
+    }
+
+    private static func authorizationRuleBelongsToCurrentApp(
+        _ definition: CFDictionary
+    ) -> Bool {
+        let identifier = (definition as NSDictionary)["identifier"] as? String
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return false }
+        return identifier == bundleIdentifier
+            || identifier == trustedTemporaryOwnerIdentifier
+    }
+}
