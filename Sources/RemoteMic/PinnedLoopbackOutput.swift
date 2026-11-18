@@ -11,7 +11,17 @@ final class PinnedLoopbackOutput {
     private let callbackQueue = DispatchQueue(label: "RemoteMic.loopback.callbacks")
     private let tailDelay: TimeInterval
     private var audioQueue: AudioQueueRef?
-    private var completions: [UInt: (Bool) -> Void] = [:]
+    private typealias Completion = (Bool) -> Void
+
+    private struct Segment {
+        var samples: ArraySlice<Float>
+        let completion: Completion
+    }
+
+    private static let framesPerBuffer = 512
+    private static let bufferCount = 3
+    private var pending: [Segment] = []
+    private var completions: [UInt: [Completion]] = [:]
 
     init?(deviceID: AudioDeviceID, deviceUID: String, sampleRate: Double, ownerQueue: DispatchQueue) {
         self.deviceID = deviceID
@@ -35,7 +45,7 @@ final class PinnedLoopbackOutput {
             AudioQueueSetProperty(queue, kAudioQueueProperty_CurrentDevice, &uidReference,
                                   UInt32(MemoryLayout<Unmanaged<CFString>>.size))
         }
-        guard selected == noErr, matchesPinnedUID,
+        guard selected == noErr, matchesPinnedUID, prime(queue),
               AudioQueueStart(queue, nil) == noErr,
               matchesPinnedUID else {
             close()
@@ -76,28 +86,51 @@ final class PinnedLoopbackOutput {
 
     func enqueue(_ samples: UnsafeBufferPointer<Float>, completion: @escaping (Bool) -> Void) -> Bool {
         dispatchPrecondition(condition: .onQueue(ownerQueue))
-        guard let audioQueue, let base = samples.baseAddress, !samples.isEmpty,
-              actualRouteIsPinned else { return false }
-        let byteCount = UInt32(samples.count * MemoryLayout<Float>.size)
-        var buffer: AudioQueueBufferRef?
-        guard AudioQueueAllocateBuffer(audioQueue, byteCount, &buffer) == noErr, let buffer else { return false }
-        memcpy(buffer.pointee.mAudioData, base, Int(byteCount))
-        buffer.pointee.mAudioDataByteSize = byteCount
-        let token = UInt(bitPattern: buffer)
-        completions[token] = completion
-        guard AudioQueueEnqueueBuffer(audioQueue, buffer, 0, nil) == noErr else {
-            completions.removeValue(forKey: token)
-            AudioQueueFreeBuffer(audioQueue, buffer)
-            return false
-        }
+        guard !samples.isEmpty, actualRouteIsPinned else { return false }
+        pending.append(Segment(samples: Array(samples)[...], completion: completion))
         return true
     }
 
     func close() {
         guard let queue = audioQueue else { return }
         audioQueue = nil
+        pending.removeAll()
         completions.removeAll()
         AudioQueueDispose(queue, true)
+    }
+
+    private func prime(_ queue: AudioQueueRef) -> Bool {
+        for _ in 0..<Self.bufferCount {
+            let bytes = UInt32(Self.framesPerBuffer * MemoryLayout<Float>.size)
+            var buffer: AudioQueueBufferRef?
+            guard AudioQueueAllocateBuffer(queue, bytes, &buffer) == noErr, let buffer,
+                  refill(buffer, queue: queue) else { return false }
+        }
+        return true
+    }
+
+    /// The queue runs continuously at the device clock. Fill any gap with
+    /// silence so irregular Bluetooth frame arrival cannot starve the queue.
+    private func refill(_ buffer: AudioQueueBufferRef, queue: AudioQueueRef) -> Bool {
+        let bytes = Self.framesPerBuffer * MemoryLayout<Float>.size
+        let destination = buffer.pointee.mAudioData.assumingMemoryBound(to: Float.self)
+        var written = 0
+        var finished: [Completion] = []
+        while written < Self.framesPerBuffer, !pending.isEmpty {
+            let count = min(Self.framesPerBuffer - written, pending[0].samples.count)
+            pending[0].samples.withUnsafeBufferPointer { source in
+                destination.advanced(by: written).update(from: source.baseAddress!, count: count)
+            }
+            written += count
+            pending[0].samples.removeFirst(count)
+            if pending[0].samples.isEmpty {
+                finished.append(pending.removeFirst().completion)
+            }
+        }
+        for index in written..<Self.framesPerBuffer { destination[index] = 0 }
+        buffer.pointee.mAudioDataByteSize = UInt32(bytes)
+        completions[UInt(bitPattern: buffer)] = finished
+        return AudioQueueEnqueueBuffer(queue, buffer, 0, nil) == noErr
     }
 
     private func bufferConsumed(queueToken: UInt, bufferToken: UInt) {
@@ -105,13 +138,22 @@ final class PinnedLoopbackOutput {
             guard let self, let audioQueue = self.audioQueue,
                   UInt(bitPattern: audioQueue) == queueToken,
                   let buffer = AudioQueueBufferRef(bitPattern: bufferToken),
-                  let completion = self.completions.removeValue(forKey: bufferToken) else { return }
-            AudioQueueFreeBuffer(audioQueue, buffer)
-            // AudioQueue has consumed the buffer. Give the device enough time
-            // to deliver the tail before allowing the host to release Fn.
+                  let played = self.completions.removeValue(forKey: bufferToken) else { return }
+
+            if !self.actualRouteIsPinned || !self.refill(buffer, queue: audioQueue) {
+                let failed = played.first
+                    ?? self.completions.values.lazy.compactMap { $0.first }.first
+                    ?? self.pending.first?.completion
+                self.close()
+                failed?(false)
+                return
+            }
+
+            guard !played.isEmpty else { return }
             self.ownerQueue.asyncAfter(deadline: .now() + self.tailDelay) { [weak self] in
                 guard let self, self.audioQueue != nil else { return }
-                completion(self.actualRouteIsPinned)
+                let valid = self.actualRouteIsPinned
+                played.forEach { $0(valid) }
             }
         }
     }
