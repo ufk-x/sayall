@@ -187,6 +187,6 @@ struct FrameAccumulator {
     }
 
     mutating func reset() {
-        pending.removeAll(keepingCapacity: true)
+        pending = Data()
     }
 }

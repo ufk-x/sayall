@@ -986,6 +986,25 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     private var idleVirtualAudioReleaseWorkItem: DispatchWorkItem?
     private var systemAudioSuspensionState = SystemAudioSuspensionState()
     private var managedDefaultInputTransition: ManagedDefaultInputTransition?
+    private var usesScopedRemoteVoiceInput: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "SayAllScopedVoiceInput") as? Bool == true
+            && settings.selectedAudioDeviceUID == VoiceInputRoute.buddyMicUID
+    }
+    private let remoteVoiceInput = VoiceInputRoute(
+        current: { CoreAudioDeviceCatalog.defaultInputDevice()?.uid },
+        available: { uid in CoreAudioDeviceCatalog.inputDevices().contains { $0.uid == uid } },
+        select: { uid in
+            guard let device = CoreAudioDeviceCatalog.inputDevices().first(where: { $0.uid == uid }) else { return false }
+            return CoreAudioDeviceCatalog.setDefaultInputDevice(device) == noErr
+                && CoreAudioDeviceCatalog.defaultInputDevice()?.uid == uid
+        },
+        fallback: { excluded in
+            CoreAudioDeviceCatalog.preferredFallbackInput(
+                excludingUID: excluded, preferredUID: "BuiltInMicrophoneDevice"
+            )?.uid
+        },
+        log: { AppLogger.shared.write("AUDIO SCOPED_INPUT \($0)") }
+    )
     private lazy var audioHardwareListener: AudioObjectPropertyListenerBlock = { [weak self] count, addresses in
         let properties = Self.audioHardwarePropertyNames(count: count, addresses: addresses)
         self?.scheduleAudioRecovery(reason: "hardware_change", details: "properties=\(properties)")
@@ -1640,6 +1659,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         voiceSessionUsageSource = nil
         voiceSessionApplicationName = nil
         releaseVoiceKeyIfNeeded()
+        remoteVoiceInput.restore()
         stopHIDMonitors()
         isAudioOutputReady = false
         virtualAudioReleaseGeneration &+= 1
@@ -3054,6 +3074,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
 
     private func startObservingAudioHardware() {
         guard observedAudioHardwareAddresses.isEmpty else { return }
+        remoteVoiceInput.restore()
         rememberCurrentUserInputDeviceIfNeeded(reason: "audio_monitor_start")
         for selector in [
             kAudioHardwarePropertyDevices,
@@ -3117,6 +3138,18 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 return
             }
             let configurationHealthy = self.audioOutput.isConfigurationHealthyForDiagnostics
+            // Core Audio can announce a device-list change when the input
+            // method opens the loopback. Keep the explicitly pinned queue
+            // alive if the device is still present at the same HAL ID.
+            if details == "properties=devices", configurationHealthy,
+               self.usesScopedRemoteVoiceInput,
+               let selected = self.audioOutput.selectedDevice,
+               CoreAudioDeviceCatalog.outputDevices().contains(where: {
+                   $0.id == selected.id && $0.uid == selected.uid
+               }) {
+                self.refreshAudioDevices()
+                return
+            }
             guard !VirtualAudioRecoveryPolicy.shouldIgnoreDefaultSystemOutputChange(
                 details: details,
                 configurationHealthy: configurationHealthy
@@ -8241,7 +8274,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func switchDefaultInputToFallbackIfNeeded(reason: String) {
-        guard !macMicrophoneState.isActive else { return }
+        guard !usesScopedRemoteVoiceInput, !macMicrophoneState.isActive else { return }
         guard managedDefaultInputTransition == nil else { return }
         let selectedUID = settings.selectedAudioDeviceUID
         guard !selectedUID.isEmpty,
@@ -8303,7 +8336,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     }
 
     private func restoreManagedDefaultInputIfAppropriate(reason: String) {
-        guard !macMicrophoneState.isActive else { return }
+        guard !usesScopedRemoteVoiceInput, !macMicrophoneState.isActive else { return }
         guard let transition = managedDefaultInputTransition else { return }
         let currentDefault = CoreAudioDeviceCatalog.defaultInputDevice()
         guard DefaultInputFallbackPolicy.shouldRestoreVirtualInput(
@@ -9194,6 +9227,19 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
                 return
             }
         }
+        if usesScopedRemoteVoiceInput,
+           chromecastFeature.remoteModel == .googleTVRemoteG9N9N,
+           effectiveChromecastVoiceMode == .hold,
+           !remoteVoiceInput.begin(virtualUID: VoiceInputRoute.buddyMicUID) {
+            pendingChromecastVoiceStart = false
+            pendingChromecastVoiceAudio.cancel()
+            pendingChromecastVoiceStopReason = nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.chromecastVoiceActive, !self.pendingChromecastVoiceStart else { return }
+                self.chromecastFeature.notifyHostVoiceSessionEnded()
+            }
+            return
+        }
         // Mark the session active before scheduling the tap release. The
         // delayed release checks this state; setting it afterwards leaves Fn
         // pressed and the target voice tool never sees a complete tap.
@@ -9202,6 +9248,7 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
         activeChromecastVoiceOperationID = operationID
         activeChromecastVoiceStartedAt = Date()
         guard beginChromecastFunctionKeyDrive() else {
+            remoteVoiceInput.restore()
             chromecastVoiceActive = false
             isChromecastVoiceActive = false
             activeChromecastVoiceOperationID = nil
@@ -9354,6 +9401,8 @@ final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDel
     ) {
         guard chromecastVoiceStopping, chromecastVoiceStopOperation == operation else { return }
         let released = finishChromecastFunctionKeyDrive()
+        // Allow the input method to receive Fn-up before restoring the input.
+        remoteVoiceInput.restore(after: 0.25)
         chromecastVoiceStopping = false
         endVoiceSessionIfNeeded(flushAudio: false)
         let outputAfterStop = audioOutput.diagnosticSnapshot(

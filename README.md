@@ -16,3 +16,8 @@ The Apple Silicon baseline was built on macOS 14.5 using Swift 6.0.3 and the mac
 SAYALL_LOCAL_PUBLIC=1 SAYALL_LOCAL_CONFIGURATION=debug SAYALL_LOCAL_BUILD_ONLY=1 \
 SAYALL_LOCAL_APP_TARGET="$PWD/build/SayAll.app" scripts/package-local-test-app.sh
 ```
+
+
+## G9N9N hold-to-talk microphone switching
+
+Build this branch with `SAYALL_SCOPED_VOICE_INPUT=1` and select Remote Buddy Mic in SayAll. In Doubao, select automatic microphone detection. SayAll borrows the system default input before sending Fn down and restores it 250 ms after the final audio and Fn up. The Bluetooth decoder and remote key assignments are the same as in the baseline.

@@ -113,6 +113,7 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 /usr/libexec/PlistBuddy -c "Add :SayAllPublicG9N9N bool $([[ "$PUBLIC_MODE" == 1 ]] && echo true || echo false)" "$APP/Contents/Info.plist"
 if [[ -n "${SAYALL_LOCAL_CAPTURE_SOURCE:-}" ]]; then
   /usr/libexec/PlistBuddy -c "Add :SayAllLocalKeyCapture bool true" "$APP/Contents/Info.plist"
+  [[ "${SAYALL_SCOPED_VOICE_INPUT:-0}" != 1 ]] || /usr/libexec/PlistBuddy -c "Add :SayAllScopedVoiceInput bool true" "$APP/Contents/Info.plist"
 fi
 codesign --force --deep --preserve-metadata=identifier --sign "$SIGNING_IDENTITY" "$APP"
 

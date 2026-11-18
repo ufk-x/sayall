@@ -811,6 +811,10 @@ final class VirtualAudioOutput {
 
     private var engine: AVAudioEngine?
     private var player: AVAudioPlayerNode?
+    private var pinnedOutput: PinnedLoopbackOutput?
+    private var usesPinnedLoopback: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "SayAllScopedVoiceInput") as? Bool == true
+    }
     private var engineConfigurationObserver: NSObjectProtocol?
     private var engineConfigurationGeneration: UInt64 = 0
     private var rejectedWriteCount = 0
@@ -1037,6 +1041,9 @@ final class VirtualAudioOutput {
             return false
         }
 
+        if usesPinnedLoopback && device.uid == VoiceInputRoute.buddyMicUID {
+            return configurePinnedOutputOnEngineQueue(device)
+        }
         logStage("connect_mixer")
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
@@ -1121,6 +1128,43 @@ final class VirtualAudioOutput {
         }
     }
 
+    private func configurePinnedOutputOnEngineQueue(_ device: AudioDeviceInfo) -> Bool {
+        dispatchPrecondition(condition: .onQueue(engineQueue))
+        guard VirtualAudioDeviceDiagnosticKind.classify(device).isSupportedLoopback,
+              let output = PinnedLoopbackOutput(deviceID: device.id, deviceUID: device.uid,
+                    sampleRate: sourceFormat.sampleRate, ownerQueue: engineQueue) else {
+            status = LocalizedMessage("audio.output.selected_unavailable")
+            logger("AUDIO PINNED_OUTPUT phase=configure result=failed reason=loopback_unavailable")
+            return false
+        }
+        // Hardware becomes visible to the process after start, independently of
+        // the queue's UID. No audio buffers are submitted while waiting for it.
+        for _ in 0..<20 {
+            if output.actualRouteIsPinned { break }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        guard output.actualRouteIsPinned else {
+            output.close()
+            status = LocalizedMessage("audio.output.selected_unavailable")
+            logger("AUDIO PINNED_OUTPUT phase=configure result=failed reason=actual_route_unverified")
+            return false
+        }
+        pinnedOutput = output
+        let route = CoreAudioDeviceCatalog.routeDiagnostic()
+        updateOutputState {
+            $0.selectedDevice = device
+            $0.actualDevice = device
+            $0.engineRunning = true
+            $0.playerPlaying = true
+            $0.ready = true
+            $0.healthy = true
+            $0.route = route
+            $0.status = LocalizedMessage("audio.output.current_format", arguments: [device.name])
+        }
+        logger("AUDIO PINNED_OUTPUT phase=configure result=ready actual_route=loopback")
+        return true
+    }
+
     var isReadyForTestTone: Bool {
         cachedOutputState.ready
     }
@@ -1134,20 +1178,26 @@ final class VirtualAudioOutput {
         guard isReadyForTestTone else { return false }
         engineQueue.async { [weak self] in
             guard let self,
-                  let player = self.player,
                   let buffer = self.makeBuffer(samples: TestToneGenerator.samples(sampleRate: self.sourceFormat.sampleRate))
             else {
                 DispatchQueue.main.async { completion(false) }
                 return
             }
-            player.scheduleBuffer(
-                buffer,
-                at: nil,
-                options: [],
-                completionCallbackType: .dataPlayedBack
-            ) { callbackType in
-                completion(callbackType == .dataPlayedBack)
+            if !self.scheduleOnEngineQueue(buffer, completion: completion) {
+                DispatchQueue.main.async { completion(false) }
             }
+        }
+        return true
+    }
+
+    private func scheduleOnEngineQueue(_ buffer: AVAudioPCMBuffer, completion: @escaping (Bool) -> Void) -> Bool {
+        if let pinnedOutput {
+            guard let channel = buffer.floatChannelData?[0] else { return false }
+            return pinnedOutput.enqueue(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)), completion: completion)
+        }
+        guard let player else { return false }
+        player.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) {
+            completion($0 == .dataPlayedBack)
         }
         return true
     }
@@ -1218,18 +1268,22 @@ final class VirtualAudioOutput {
             let isCurrent = generation == self.playbackGeneration
             self.playbackLock.unlock()
             // A preceding stop or explicit flush already accounted for an interrupted buffer.
-            guard isCurrent, let player = self.player else { return }
-            player.scheduleBuffer(
-                buffer,
-                at: nil,
-                options: [],
-                completionCallbackType: .dataPlayedBack
-            ) { [weak self] _ in
-                self?.scheduledVoiceBufferDidFinish(
+            guard isCurrent else { return }
+            let pinned = self.pinnedOutput != nil
+            let accepted = self.scheduleOnEngineQueue(buffer) { [weak self] played in
+                guard let self else { return }
+                if pinned, !played {
+                    self.stopOnPinnedRouteFailure()
+                    return
+                }
+                self.scheduledVoiceBufferDidFinish(
                     sampleCount: sampleCount,
                     generation: generation,
                     deliveryGeneration: deliveryGeneration
                 )
+            }
+            if pinned, !accepted {
+                self.stopOnPinnedRouteFailure()
             }
         }
         return true
@@ -1389,10 +1443,17 @@ final class VirtualAudioOutput {
             )
         }
         let restartPlayer = { [weak self] in
-            guard let self,
-                  let player = self.player,
-                  self.engine?.isRunning == true
-            else { return }
+            guard let self else { return }
+            if self.pinnedOutput != nil {
+                guard let device = self.selectedDevice else { return }
+                self.pinnedOutput?.close()
+                self.pinnedOutput = nil
+                if !self.configurePinnedOutputOnEngineQueue(device) {
+                    self.stopOnPinnedRouteFailure()
+                }
+                return
+            }
+            guard let player = self.player, self.engine?.isRunning == true else { return }
             player.stop()
             player.reset()
             guard AudioPlayerNodeSafety.play(player) else {
@@ -1427,6 +1488,12 @@ final class VirtualAudioOutput {
                 stopOnEngineQueue()
             }
         }
+    }
+
+    private func stopOnPinnedRouteFailure() {
+        logger("AUDIO PINNED_OUTPUT phase=delivery result=blocked reason=loopback_unverified_or_queue_failed")
+        stopOnEngineQueue()
+        onConfigurationChange?()
     }
 
     private func stopOnEngineQueue() {
@@ -1465,6 +1532,8 @@ final class VirtualAudioOutput {
             )
         }
         removeEngineConfigurationObserver()
+        pinnedOutput?.close()
+        pinnedOutput = nil
         player?.stop()
         engine?.stop()
         player = nil
